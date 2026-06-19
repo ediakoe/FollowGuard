@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Twitter Inactive Unfollower",
+  "version": "1.0",
+  "description": "آنفالو کردن اکانت‌های غیرفعال در توییتر/ایکس",
+  "permissions": ["scripting", "activeTab", "storage"],
+  "host_permissions": ["https://x.com/*", "https://twitter.com/*"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icon.png",
+      "48": "icon.png",
+      "128": "icon.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://x.com/*", "https://twitter.com/*"],
+      "js": ["content.js"]
+    }
+  ]
+}

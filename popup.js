@@ -8,6 +8,14 @@ const statusText = $('statusText');
 const list = $('candidateList');
 const riskFilter = $('riskFilter');
 const scoreFilter = $('scoreFilter');
+const scanTab = $('scanTab');
+const historyTab = $('historyTab');
+const scanPanel = $('scanPanel');
+const historyPanel = $('historyPanel');
+const historyList = $('historyList');
+const addedCount = $('addedCount');
+const removedCount = $('removedCount');
+const changedCount = $('changedCount');
 
 let running = false;
 let accounts = [];
@@ -78,11 +86,79 @@ function formatNum(value) {
   return Number.isFinite(n) ? n.toLocaleString() : '—';
 }
 
+function formatDate(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return 'تاریخ نامشخص';
+  return new Intl.DateTimeFormat('fa-IR', {
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit'
+  }).format(date);
+}
+
 function setRunning(value) {
   running = Boolean(value);
   btn.className = running ? 'mainbtn stop' : 'mainbtn';
   btn.textContent = running ? '⏹ توقف اسکن' : '🔍 شروع اسکن';
   btn.disabled = false;
+}
+
+function renderDiffSection(title, items, type) {
+  if (!items.length) return '';
+  const rows = items.slice(0, 25).map(a => {
+    const label = `@${escapeHtml(a.username || 'unknown')}`;
+    const score = type === 'changed' ? `Score ${a.score}` : '';
+    return `<div class="diff-item"><span class="diff-handle">${label}</span><span class="diff-score ${type}">${score}</span></div>`;
+  }).join('');
+  return `<div class="section-title">${title} (${items.length})</div>${rows}`;
+}
+
+async function renderHistory() {
+  const history = await FollowGuardHistory.getHistory();
+  if (!history.length) {
+    historyList.innerHTML = '<div class="empty">هنوز تاریخچه‌ای ثبت نشده.<br>بعد از اولین اسکن، snapshot اینجا ذخیره می‌شود.</div>';
+    addedCount.textContent = '0';
+    removedCount.textContent = '0';
+    changedCount.textContent = '0';
+    return;
+  }
+
+  const latest = history[0];
+  const current = accounts.length ? accounts : latest.accounts || [];
+  const diff = accounts.length ? await FollowGuardHistory.compareWithPrevious(accounts) : {added:[],removed:[],changed:[]};
+  addedCount.textContent = diff.added.length;
+  removedCount.textContent = diff.removed.length;
+  changedCount.textContent = diff.changed.length;
+
+  historyList.innerHTML = history.map((snapshot, index) => `
+    <div class="history-card">
+      <div class="history-head">
+        <div class="history-date">${formatDate(snapshot.createdAt)}</div>
+        <div class="history-id">#${history.length - index}</div>
+      </div>
+      <div class="history-meta">${formatNum(snapshot.count)} حساب · ${formatNum(snapshot.candidates)} کاندید</div>
+    </div>
+  `).join('');
+
+  if (accounts.length) {
+    historyList.innerHTML += `<div class="section-title">مقایسه با آخرین Snapshot</div>
+      ${renderDiffSection('حساب‌های جدید', diff.added, 'added')}
+      ${renderDiffSection('حساب‌های خارج‌شده', diff.removed, 'removed')}
+      ${renderDiffSection('امتیازهای تغییرکرده', diff.changed, 'changed')}
+      ${!diff.added.length && !diff.removed.length && !diff.changed.length ? '<div class="empty">تغییر قابل توجهی نسبت به Snapshot قبلی پیدا نشد.</div>' : ''}`;
+  } else {
+    historyList.innerHTML += `<div class="section-title">آخرین Snapshot</div><div class="empty">${escapeHtml(formatDate(latest.createdAt))}<br>برای Compare واقعی، یک اسکن جدید انجام بده.</div>`;
+  }
+
+  void current;
+}
+
+function showPanel(panel) {
+  const historyMode = panel === 'history';
+  scanPanel.classList.toggle('hidden', historyMode);
+  historyPanel.classList.toggle('hidden', !historyMode);
+  scanTab.classList.toggle('active', !historyMode);
+  historyTab.classList.toggle('active', historyMode);
+  if (historyMode) renderHistory();
 }
 
 function exportCsv() {
@@ -104,11 +180,22 @@ function exportCsv() {
   URL.revokeObjectURL(url);
 }
 
-$('selectAll').addEventListener('click', () => filteredAccounts().forEach(a => selected.add(a.username)) || render());
+$('selectAll').addEventListener('click', () => {
+  filteredAccounts().forEach(a => selected.add(a.username));
+  render();
+});
 $('clearAll').addEventListener('click', () => { selected.clear(); render(); });
 $('exportBtn').addEventListener('click', exportCsv);
 riskFilter.addEventListener('change', render);
 scoreFilter.addEventListener('change', render);
+scanTab.addEventListener('click', () => showPanel('scan'));
+historyTab.addEventListener('click', () => showPanel('history'));
+$('refreshHistory').addEventListener('click', renderHistory);
+$('clearHistory').addEventListener('click', async () => {
+  if (!confirm('کل تاریخچه اسکن‌ها پاک شود؟')) return;
+  await FollowGuardHistory.clearHistory();
+  await renderHistory();
+});
 
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.action === 'SCAN_UPDATE') {
@@ -126,6 +213,9 @@ chrome.runtime.onMessage.addListener((msg) => {
     statusText.textContent = `✅ اسکن تمام شد — ${msg.stats?.candidates || 0} کاندید`;
     render();
     setRunning(false);
+    if (accounts.length) {
+      FollowGuardHistory.saveScanHistory(accounts).then(() => renderHistory()).catch(() => {});
+    }
   }
   if (msg.action === 'ERROR') {
     setRunning(false);
@@ -178,4 +268,5 @@ btn.addEventListener('click', async () => {
     render();
     setRunning(res.isScanning);
   });
+  await renderHistory();
 })();

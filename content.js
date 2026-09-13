@@ -1,169 +1,254 @@
-// Content script - runs on x.com / twitter.com
+// FollowGuard V2 - read-only scanner
+// Scans the visible Following list on X and produces review candidates.
+// It does NOT click Follow/Unfollow buttons and does not perform account actions.
 
-let isRunning = false;
-let stats = { scanned: 0, unfollowed: 0, skipped: 0 };
+let scanState = {
+  isScanning: false,
+  scanned: 0,
+  candidates: 0,
+  skipped: 0,
+  accounts: []
+};
 
-// Listen for messages from popup
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.action === 'START') {
-    if (!isRunning) {
-      isRunning = true;
-      stats = { scanned: 0, unfollowed: 0, skipped: 0 };
-      startUnfollowing(msg.options);
+  if (msg.action === 'SCAN') {
+    if (!scanState.isScanning) {
+      scanState = {
+        isScanning: true,
+        scanned: 0,
+        candidates: 0,
+        skipped: 0,
+        accounts: []
+      };
+      scanFollowing(msg.options || {}).catch(handleScanError);
     }
     sendResponse({ status: 'started' });
+    return true;
   }
-  if (msg.action === 'STOP') {
-    isRunning = false;
+
+  if (msg.action === 'STOP_SCAN') {
+    scanState.isScanning = false;
+    sendUpdate();
     sendResponse({ status: 'stopped' });
+    return true;
   }
+
   if (msg.action === 'GET_STATS') {
-    sendResponse({ stats, isRunning });
+    sendResponse({ stats: scanState });
+    return true;
   }
-  return true;
 });
 
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+function sendUpdate(action = 'SCAN_UPDATE') {
+  chrome.runtime.sendMessage({
+    action,
+    stats: {
+      scanned: scanState.scanned,
+      candidates: scanState.candidates,
+      skipped: scanState.skipped,
+      isScanning: scanState.isScanning,
+      accounts: scanState.accounts
+    }
+  }).catch(() => {});
 }
 
-function sendUpdate() {
-  chrome.runtime.sendMessage({ action: 'UPDATE', stats, isRunning }).catch(() => {});
-}
-
-async function startUnfollowing(options) {
-  const { minDaysInactive, skipVerified, skipWithBio, delayMs } = options;
-
-  // Navigate to following page
+async function scanFollowing(options) {
   const username = getUsernameFromPage();
   if (!username) {
-    chrome.runtime.sendMessage({ action: 'ERROR', msg: 'نام کاربری پیدا نشد. مطمئن شو توی توییتر/ایکس لاگین هستی.' }).catch(() => {});
-    isRunning = false;
+    finishWithError('نام کاربری پیدا نشد. داخل حساب X باش.');
     return;
   }
 
-  const followingUrl = `https://x.com/${username}/following`;
-  if (!window.location.href.includes('/following')) {
-    window.location.href = followingUrl;
-    return;
+  if (!window.location.pathname.endsWith('/following')) {
+    window.location.href = `https://x.com/${username}/following`;
+    await sleep(2500);
   }
 
-  await sleep(2000);
+  const maxAccounts = Number(options.maxAccounts || 500);
+  const minScore = Number(options.minScore ?? 50);
+  const skipVerified = options.skipVerified !== false;
+  const skipWithBio = options.skipWithBio === true;
 
-  while (isRunning) {
+  let idleRounds = 0;
+
+  while (scanState.isScanning && scanState.scanned < maxAccounts) {
     const cards = getFollowingCards();
-    if (cards.length === 0) {
-      await sleep(1000);
-      scrollDown();
-      await sleep(2000);
-      const newCards = getFollowingCards();
-      if (newCards.length === 0) {
-        // Done
-        isRunning = false;
-        chrome.runtime.sendMessage({ action: 'DONE', stats }).catch(() => {});
-        return;
-      }
-      continue;
-    }
+    let processedThisRound = 0;
 
     for (const card of cards) {
-      if (!isRunning) break;
+      if (!scanState.isScanning || scanState.scanned >= maxAccounts) break;
+      if (card.dataset.followguardProcessed === 'true') continue;
 
-      try {
-        const info = extractCardInfo(card);
-        stats.scanned++;
+      card.dataset.followguardProcessed = 'true';
+      processedThisRound++;
 
-        const shouldUnfollow = evaluateAccount(info, { minDaysInactive, skipVerified, skipWithBio });
+      const info = extractCardInfo(card);
+      scanState.scanned++;
 
-        if (shouldUnfollow) {
-          const unfollowed = await unfollowAccount(card);
-          if (unfollowed) {
-            stats.unfollowed++;
-          } else {
-            stats.skipped++;
-          }
-          await sleep(delayMs + Math.random() * 500);
-        } else {
-          stats.skipped++;
-        }
-
-        sendUpdate();
-        card.dataset.processed = 'true';
-      } catch (e) {
-        card.dataset.processed = 'true';
-        stats.skipped++;
+      if (!info.username) {
+        scanState.skipped++;
+        continue;
       }
+
+      const analysis = analyzeAccount(info, { skipVerified, skipWithBio });
+      if (analysis.score >= minScore && !analysis.excluded) {
+        scanState.candidates++;
+        scanState.accounts.push({ ...info, ...analysis });
+      } else {
+        scanState.skipped++;
+      }
+
+      sendUpdate();
     }
 
-    scrollDown();
-    await sleep(2000);
-  }
-}
+    if (processedThisRound === 0) {
+      idleRounds++;
+    } else {
+      idleRounds = 0;
+    }
 
-function getUsernameFromPage() {
-  // Try from URL
-  const match = window.location.pathname.match(/^\/([^/]+)/);
-  if (match && match[1] && !['home', 'explore', 'notifications', 'messages', 'i'].includes(match[1])) {
-    return match[1];
+    if (idleRounds >= 3) break;
+
+    window.scrollBy({ top: Math.max(window.innerHeight * 0.85, 500), behavior: 'smooth' });
+    await sleep(1500);
   }
-  // Try from nav link
-  const profileLink = document.querySelector('a[data-testid="AppTabBar_Profile_Link"]');
-  if (profileLink) {
-    const m = profileLink.href.match(/\/([^/]+)$/);
-    if (m) return m[1];
-  }
-  return null;
+
+  scanState.isScanning = false;
+  sendUpdate('SCAN_DONE');
 }
 
 function getFollowingCards() {
-  const all = document.querySelectorAll('[data-testid="UserCell"]:not([data-processed="true"])');
-  return Array.from(all);
+  return Array.from(document.querySelectorAll('[data-testid="UserCell"]'))
+    .filter(card => card.dataset.followguardProcessed !== 'true');
 }
 
 function extractCardInfo(card) {
   const nameEl = card.querySelector('[data-testid="User-Name"]');
-  const name = nameEl ? nameEl.textContent : '';
+  const descriptionEl = card.querySelector('[data-testid="UserDescription"]');
+  const links = Array.from(card.querySelectorAll('a[href]'));
 
-  const bioEl = card.querySelector('[data-testid="UserDescription"]');
-  const bio = bioEl ? bioEl.textContent.trim() : '';
+  const profileLink = links.find(a => {
+    const href = a.getAttribute('href') || '';
+    return /^\/[^/]+$/.test(href) && !href.includes('/following');
+  });
 
-  const verifiedEl = card.querySelector('[data-testid="icon-verified"]');
-  const isVerified = !!verifiedEl;
+  const username = profileLink
+    ? (profileLink.getAttribute('href') || '').replace(/^\//, '')
+    : extractUsernameFromText(card.textContent || '');
 
-  return { name, bio, isVerified };
+  const name = (nameEl?.textContent || '').trim();
+  const bio = (descriptionEl?.textContent || '').trim();
+  const text = card.textContent || '';
+
+  const isVerified = !!card.querySelector('[data-testid="icon-verified"]') ||
+    /verified/i.test(card.getAttribute('aria-label') || '');
+
+  const followers = parseMetric(text, /([\d,.]+)\s*(K|M|B)?\s*Followers/i);
+  const following = parseMetric(text, /([\d,.]+)\s*(K|M|B)?\s*Following/i);
+
+  return {
+    username: username ? `@${username.split('/')[0]}` : '',
+    name,
+    bio,
+    isVerified,
+    followers,
+    following,
+    profileUrl: username ? `https://x.com/${username.split('/')[0]}` : ''
+  };
 }
 
-function evaluateAccount(info, options) {
-  const { skipVerified, skipWithBio } = options;
+function analyzeAccount(info, options) {
+  const reasons = [];
+  let score = 0;
+  let excluded = false;
 
-  if (skipVerified && info.isVerified) return false;
-  if (skipWithBio && info.bio && info.bio.length > 0) return false;
-
-  // Mark as inactive if no bio (simple heuristic)
-  const hasNoBio = !info.bio || info.bio.length === 0;
-  return hasNoBio;
-}
-
-async function unfollowAccount(card) {
-  // Find the Following/Unfollow button
-  const btn = card.querySelector('[data-testid$="-unfollow"]') ||
-               card.querySelector('[role="button"][aria-label*="Following"]');
-
-  if (!btn) return false;
-
-  btn.click();
-  await sleep(500);
-
-  // Confirm dialog if appears
-  const confirmBtn = document.querySelector('[data-testid="confirmationSheetConfirm"]');
-  if (confirmBtn) {
-    confirmBtn.click();
-    await sleep(300);
+  if (info.isVerified && options.skipVerified) {
+    excluded = true;
+    reasons.push('verified');
   }
 
-  return true;
+  if (info.bio) {
+    score += 10;
+  } else {
+    score += 35;
+    reasons.push('no bio');
+  }
+
+  if (!info.name) {
+    score += 10;
+    reasons.push('minimal profile');
+  }
+
+  if (Number.isFinite(info.followers)) {
+    if (info.followers < 10) {
+      score += 25;
+      reasons.push('very low followers');
+    } else if (info.followers < 50) {
+      score += 15;
+      reasons.push('low followers');
+    }
+  }
+
+  if (info.following > 0 && Number.isFinite(info.followers) && info.following > info.followers * 10) {
+    score += 10;
+    reasons.push('high following/follower ratio');
+  }
+
+  if (options.skipWithBio && info.bio) {
+    excluded = true;
+  }
+
+  score = Math.min(100, score);
+
+  return {
+    score,
+    reasons,
+    excluded,
+    risk: score >= 75 ? 'high' : score >= 50 ? 'medium' : 'low'
+  };
 }
 
-function scrollDown() {
-  window.scrollBy(0, window.innerHeight * 0.8);
+function parseMetric(text, regex) {
+  const match = text.match(regex);
+  if (!match) return NaN;
+  const value = Number(String(match[1]).replace(/,/g, ''));
+  const suffix = (match[2] || '').toUpperCase();
+  const multiplier = suffix === 'K' ? 1e3 : suffix === 'M' ? 1e6 : suffix === 'B' ? 1e9 : 1;
+  return value * multiplier;
+}
+
+function extractUsernameFromText(text) {
+  const match = text.match(/@([A-Za-z0-9_]{1,15})/);
+  return match ? match[1] : '';
+}
+
+function getUsernameFromPage() {
+  const match = window.location.pathname.match(/^\/([^/]+)/);
+  if (match && match[1] && !['home', 'explore', 'notifications', 'messages', 'i', 'search'].includes(match[1])) {
+    return match[1];
+  }
+
+  const profileLink = document.querySelector('a[data-testid="AppTabBar_Profile_Link"]');
+  if (profileLink) {
+    const href = profileLink.getAttribute('href') || '';
+    const profileMatch = href.match(/^\/([^/]+)/);
+    if (profileMatch) return profileMatch[1];
+  }
+
+  return null;
+}
+
+function handleScanError(error) {
+  scanState.isScanning = false;
+  chrome.runtime.sendMessage({
+    action: 'ERROR',
+    msg: error?.message || 'خطای نامشخص هنگام اسکن رخ داد.'
+  }).catch(() => {});
+}
+
+function finishWithError(message) {
+  scanState.isScanning = false;
+  chrome.runtime.sendMessage({ action: 'ERROR', msg: message }).catch(() => {});
 }

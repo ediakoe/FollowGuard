@@ -13,121 +13,114 @@ const riskAck = document.getElementById('riskAck');
 
 let running = false;
 
-// Risk panel expand/collapse
-riskToggle.addEventListener('click', () => {
-  riskBox.classList.toggle('open');
-});
+riskToggle?.addEventListener('click', () => riskBox?.classList.toggle('open'));
 
-// Restore previous acknowledgment (per-browser, not per-account)
 chrome.storage.local.get(['riskAcknowledged'], (res) => {
-  if (res.riskAcknowledged) {
-    riskAck.checked = true;
-    updateButtonGate();
-  } else {
-    riskBox.classList.add('open'); // force visible until acknowledged
-  }
+  if (riskAck) riskAck.checked = Boolean(res.riskAcknowledged);
+  if (!res.riskAcknowledged) riskBox?.classList.add('open');
+  updateButtonGate();
 });
 
-riskAck.addEventListener('change', () => {
+riskAck?.addEventListener('change', () => {
   chrome.storage.local.set({ riskAcknowledged: riskAck.checked });
   updateButtonGate();
 });
 
 function updateButtonGate() {
-  if (riskAck.checked) {
-    btn.disabled = false;
-    if (!running) btn.textContent = '▶ شروع';
-  } else {
-    btn.disabled = true;
-    btn.textContent = 'ابتدا ریسک‌ها رو تایید کن';
-  }
+  if (!btn) return;
+  btn.disabled = running ? false : !riskAck?.checked;
+  btn.textContent = running ? '⏹ توقف اسکن' : (riskAck?.checked ? '🔍 شروع اسکن' : 'ابتدا ریسک‌ها رو تایید کن');
 }
 
-delaySlider.addEventListener('input', () => {
-  delayVal.textContent = delaySlider.value;
+delaySlider?.addEventListener('input', () => {
+  if (delayVal) delayVal.textContent = delaySlider.value;
 });
 
-function updateStats(stats) {
-  scanCount.textContent = stats.scanned || 0;
-  unfollowCount.textContent = stats.unfollowed || 0;
-  skipCount.textContent = stats.skipped || 0;
-  progressFill.style.width = Math.min((stats.unfollowed / Math.max(stats.scanned, 1)) * 100 * 2, 100) + '%';
-  statusText.textContent = `اسکن شد: ${stats.scanned} | آنفالو: ${stats.unfollowed}`;
+function updateStats(stats = {}) {
+  if (scanCount) scanCount.textContent = stats.scanned || 0;
+  if (unfollowCount) unfollowCount.textContent = stats.candidates || 0;
+  if (skipCount) skipCount.textContent = stats.skipped || 0;
+
+  const total = Math.max(stats.scanned || 0, 1);
+  if (progressFill) progressFill.style.width = Math.min(((stats.scanned || 0) / total) * 100, 100) + '%';
+  if (statusText) statusText.textContent = `اسکن شد: ${stats.scanned || 0} | کاندید: ${stats.candidates || 0}`;
 }
 
-function setRunning(val) {
-  running = val;
-  btn.className = val ? 'btn btn-stop' : 'btn btn-start';
-  btn.disabled = val ? false : !riskAck.checked;
-  btn.textContent = val ? '⏹ توقف' : (riskAck.checked ? '▶ شروع' : 'ابتدا ریسک‌ها رو تایید کن');
-  progressWrap.classList.toggle('visible', val);
-}
-
-// Listen for updates from content script
-chrome.runtime.onMessage.addListener((msg) => {
-  if (msg.action === 'UPDATE') {
-    updateStats(msg.stats);
+function setRunning(value) {
+  running = Boolean(value);
+  if (btn) {
+    btn.className = running ? 'btn btn-stop' : 'btn btn-start';
+    updateButtonGate();
   }
-  if (msg.action === 'DONE') {
+  progressWrap?.classList.toggle('visible', running);
+}
+
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg.action === 'SCAN_UPDATE') {
+    updateStats(msg.stats);
+    setRunning(true);
+  }
+
+  if (msg.action === 'SCAN_DONE') {
     updateStats(msg.stats);
     setRunning(false);
-    statusText.textContent = `✅ تموم شد! ${msg.stats.unfollowed} نفر آنفالو شدن.`;
-    progressFill.style.width = '100%';
-    progressFill.style.animation = 'none';
+    if (statusText) statusText.textContent = `✅ اسکن تمام شد — ${msg.stats.candidates || 0} کاندید پیدا شد.`;
+    if (progressFill) progressFill.style.width = '100%';
   }
+
   if (msg.action === 'ERROR') {
     setRunning(false);
-    statusText.textContent = '❌ ' + msg.msg;
-    progressWrap.classList.add('visible');
+    if (statusText) statusText.textContent = '❌ ' + msg.msg;
+    progressWrap?.classList.add('visible');
   }
 });
 
-btn.addEventListener('click', async () => {
+btn?.addEventListener('click', async () => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
 
-  if (!tab || (!tab.url.includes('x.com') && !tab.url.includes('twitter.com'))) {
-    statusText.textContent = '❌ لطفاً توی x.com باش';
-    progressWrap.classList.add('visible');
+  if (!tab?.id || (!tab.url?.includes('x.com') && !tab.url?.includes('twitter.com'))) {
+    if (statusText) statusText.textContent = '❌ لطفاً داخل x.com باش.';
+    progressWrap?.classList.add('visible');
+    return;
+  }
+
+  try {
+    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
+  } catch (e) {
+    if (statusText) statusText.textContent = '❌ دسترسی اسکریپت به صفحه ممکن نیست. صفحه را ریفرش کن.';
     return;
   }
 
   if (!running) {
     const options = {
-      skipVerified: document.getElementById('skipVerified').checked,
-      skipWithBio: document.getElementById('skipWithBio').checked,
-      delayMs: parseInt(delaySlider.value) * 1000,
+      skipVerified: Boolean(document.getElementById('skipVerified')?.checked),
+      skipWithBio: Boolean(document.getElementById('skipWithBio')?.checked),
+      maxAccounts: 500
     };
 
-    try {
-      await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        files: ['content.js']
-      });
-    } catch(e) {}
-
-    chrome.tabs.sendMessage(tab.id, { action: 'START', options }, (res) => {
+    chrome.tabs.sendMessage(tab.id, { action: 'SCAN', options }, (res) => {
       if (chrome.runtime.lastError) {
-        statusText.textContent = '❌ خطا در اتصال. صفحه رو ریفرش کن.';
-        progressWrap.classList.add('visible');
+        if (statusText) statusText.textContent = '❌ اتصال برقرار نشد. صفحه X را ریفرش کن.';
+        progressWrap?.classList.add('visible');
         return;
       }
       setRunning(true);
+      if (statusText) statusText.textContent = '🔎 در حال اسکن Following...';
     });
   } else {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    chrome.tabs.sendMessage(tab.id, { action: 'STOP' });
+    chrome.tabs.sendMessage(tab.id, { action: 'STOP_SCAN' });
     setRunning(false);
-    statusText.textContent = '⏸ متوقف شد';
+    if (statusText) statusText.textContent = '⏸ اسکن متوقف شد';
   }
 });
 
-// On popup open, get current state
 (async () => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab) return;
+  if (!tab?.id) return;
+
   chrome.tabs.sendMessage(tab.id, { action: 'GET_STATS' }, (res) => {
     if (chrome.runtime.lastError || !res) return;
     updateStats(res.stats);
-    setRunning(res.isRunning);
+    setRunning(res.isScanning);
   });
 })();

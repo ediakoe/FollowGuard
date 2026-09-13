@@ -20,6 +20,7 @@ const changedCount = $('changedCount');
 let running = false;
 let accounts = [];
 let selected = new Set();
+let latestDiff = null;
 
 function updateStats(stats = {}) {
   scanCount.textContent = stats.scanned || 0;
@@ -123,8 +124,7 @@ async function renderHistory() {
   }
 
   const latest = history[0];
-  const current = accounts.length ? accounts : latest.accounts || [];
-  const diff = accounts.length ? await FollowGuardHistory.compareWithPrevious(accounts) : {added:[],removed:[],changed:[]};
+  const diff = accounts.length && latestDiff ? latestDiff : {added:[],removed:[],changed:[]};
   addedCount.textContent = diff.added.length;
   removedCount.textContent = diff.removed.length;
   changedCount.textContent = diff.changed.length;
@@ -140,7 +140,7 @@ async function renderHistory() {
   `).join('');
 
   if (accounts.length) {
-    historyList.innerHTML += `<div class="section-title">مقایسه با آخرین Snapshot</div>
+    historyList.innerHTML += `<div class="section-title">مقایسه با آخرین Snapshot قبلی</div>
       ${renderDiffSection('حساب‌های جدید', diff.added, 'added')}
       ${renderDiffSection('حساب‌های خارج‌شده', diff.removed, 'removed')}
       ${renderDiffSection('امتیازهای تغییرکرده', diff.changed, 'changed')}
@@ -148,8 +148,6 @@ async function renderHistory() {
   } else {
     historyList.innerHTML += `<div class="section-title">آخرین Snapshot</div><div class="empty">${escapeHtml(formatDate(latest.createdAt))}<br>برای Compare واقعی، یک اسکن جدید انجام بده.</div>`;
   }
-
-  void current;
 }
 
 function showPanel(panel) {
@@ -194,6 +192,7 @@ $('refreshHistory').addEventListener('click', renderHistory);
 $('clearHistory').addEventListener('click', async () => {
   if (!confirm('کل تاریخچه اسکن‌ها پاک شود؟')) return;
   await FollowGuardHistory.clearHistory();
+  latestDiff = null;
   await renderHistory();
 });
 
@@ -214,7 +213,10 @@ chrome.runtime.onMessage.addListener((msg) => {
     render();
     setRunning(false);
     if (accounts.length) {
-      FollowGuardHistory.saveScanHistory(accounts).then(() => renderHistory()).catch(() => {});
+      FollowGuardHistory.compareWithPrevious(accounts).then(diff => {
+        latestDiff = diff;
+        return FollowGuardHistory.saveScanHistory(accounts);
+      }).then(() => renderHistory()).catch(() => {});
     }
   }
   if (msg.action === 'ERROR') {
@@ -246,6 +248,7 @@ btn.addEventListener('click', async () => {
 
   accounts = [];
   selected.clear();
+  latestDiff = null;
   render();
   progressFill.style.width = '0%';
   chrome.tabs.sendMessage(tab.id, {action:'SCAN', options:{skipVerified:true,skipWithBio:true,maxAccounts:500}}, (res) => {
@@ -260,7 +263,10 @@ btn.addEventListener('click', async () => {
 
 (async () => {
   const [tab] = await chrome.tabs.query({active:true,currentWindow:true});
-  if (!tab?.id) return;
+  if (!tab?.id) {
+    await renderHistory();
+    return;
+  }
   chrome.tabs.sendMessage(tab.id, {action:'GET_STATS'}, (res) => {
     if (chrome.runtime.lastError || !res) return;
     accounts = Array.isArray(res.accounts) ? res.accounts : [];
